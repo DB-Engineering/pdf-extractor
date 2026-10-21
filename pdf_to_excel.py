@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-PDF & Table Extractor (PDF to Text & Excel Converter)
-=====================================================
-Extracts text from PDF files and converts embedded tables/schedules
-into formatted multi-tab Excel spreadsheets (.xlsx).
+PDF & Table Extractor (Interactive & Targeted Table/Column Extractor)
+=====================================================================
+Extracts a specific table and requested column subset from a PDF file
+and exports it to a formatted Excel spreadsheet (.xlsx).
 
 Directory Structure:
 --------------------
@@ -14,20 +14,9 @@ root/
 └── excel_files/      (Output Excel files, e.g. page_1.xlsx)
 
 Usage:
-    # Process a specific PDF (looks in current dir or pdf_files/):
-    python3 pdf_to_excel.py page_1.pdf
-
-    # Process all PDFs in the pdf_files/ directory:
     python3 pdf_to_excel.py
-
-    # Only extract text to text_files/:
-    python3 pdf_to_excel.py page_1.pdf --text-only
-
-    # Only extract tables to excel_files/:
-    python3 pdf_to_excel.py page_1.pdf --excel-only
 """
 
-import argparse
 import re
 import sys
 import time
@@ -56,14 +45,6 @@ except ImportError:
     OPENPYXL_AVAILABLE = False
 
 
-# Default headers for terminal schedules
-DEFAULT_VAV_HEADERS = [
-    "UNIT MARK", "MANUFACTURER", "MODEL", "INLET SIZE",
-    "CFM MAX", "CFM MIN", "HEAT COIL MBH", "ROWS",
-    "GPM", "3 WAY VALVE", "CO2 SENSOR", "OCC SENSOR", "REMARKS"
-]
-
-
 def setup_directories(base_dir: Path) -> tuple[Path, Path, Path]:
     """Ensures pdf_files, text_files, and excel_files directories exist."""
     pdf_dir = base_dir / "pdf_files"
@@ -78,28 +59,21 @@ def setup_directories(base_dir: Path) -> tuple[Path, Path, Path]:
 
 
 def resolve_input_file(file_name: str, base_dir: Path) -> Path:
-    """
-    Resolves an input file path.
-    Checks relative to working dir, then in pdf_files/ or text_files/.
-    """
+    """Resolves input PDF/text file from current dir or subdirectories."""
     pdf_dir, text_dir, _ = setup_directories(base_dir)
-    target = Path(file_name)
+    target = Path(file_name.strip())
 
-    # 1. Check direct path
     if target.exists() and target.is_file():
         return target.resolve()
 
-    # 2. Check in pdf_files/
     in_pdf = pdf_dir / target.name
     if in_pdf.exists() and in_pdf.is_file():
         return in_pdf.resolve()
 
-    # 3. Check in text_files/
     in_text = text_dir / target.name
     if in_text.exists() and in_text.is_file():
         return in_text.resolve()
 
-    # 4. Try adding .pdf extension
     if not target.suffix:
         in_pdf_ext = pdf_dir / f"{target.name}.pdf"
         if in_pdf_ext.exists():
@@ -117,50 +91,97 @@ def resolve_input_file(file_name: str, base_dir: Path) -> Path:
     )
 
 
-def extract_text_pypdf(pdf_path: Path, include_headers: bool = True) -> tuple[str, int]:
-    """Extract text from PDF using pypdf."""
-    reader = pypdf.PdfReader(str(pdf_path))
-    total_pages = len(reader.pages)
+def extract_text_from_pdf_with_delimiters(pdf_path: Path, delimiter: str = " | ") -> str:
+    """
+    Extracts text from PDF while using raw bounding box coordinates and table geometry
+    to insert explicit column delimiters (|) between table cells in the text file.
+    """
     text_blocks = []
 
-    for idx, page in enumerate(reader.pages, start=1):
-        page_text = page.extract_text() or ""
-        if include_headers:
-            header = f"--- Page {idx} of {total_pages} ---"
-            text_blocks.append(f"{header}\n\n{page_text.strip()}\n")
-        else:
-            text_blocks.append(page_text.strip())
+    if PDFPLUMBER_AVAILABLE:
+        try:
+            with pdfplumber.open(str(pdf_path)) as pdf:
+                total_pages = len(pdf.pages)
+                for idx, page in enumerate(pdf.pages, start=1):
+                    # 1. Native table extraction via bounding box grid
+                    tables = page.extract_tables()
+                    if tables:
+                        page_lines = []
+                        for table in tables:
+                            for row in table:
+                                clean_row = [str(cell or "").strip().replace("\n", " ") for cell in row]
+                                clean_row = [c for c in clean_row if c != ""]
+                                if clean_row:
+                                    page_lines.append(f"{delimiter}".join(clean_row))
+                        if page_lines:
+                            text_blocks.append(f"--- Page {idx} of {total_pages} ---\n\n" + "\n".join(page_lines))
+                            continue
 
-    full_text = "\n\n".join(text_blocks)
-    return full_text, total_pages
+                    # 2. Word bounding box coordinate alignment fallback
+                    words = page.extract_words()
+                    if words:
+                        words_sorted = sorted(words, key=lambda w: (round(w['top'], 1), w['x0']))
+                        lines = []
+                        current_line = []
+                        last_top = None
 
+                        for w in words_sorted:
+                            if last_top is None or abs(w['top'] - last_top) < 3:
+                                current_line.append(w)
+                                last_top = w['top']
+                            else:
+                                lines.append(current_line)
+                                current_line = [w]
+                                last_top = w['top']
+                        if current_line:
+                            lines.append(current_line)
 
-def extract_text_pdfplumber(pdf_path: Path, include_headers: bool = True) -> tuple[str, int]:
-    """Extract text from PDF using pdfplumber."""
-    text_blocks = []
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        total_pages = len(pdf.pages)
-        for idx, page in enumerate(pdf.pages, start=1):
+                        line_strings = []
+                        for line_words in lines:
+                            line_words = sorted(line_words, key=lambda w: w['x0'])
+                            tokens = []
+                            current_token = []
+                            last_x1 = None
+
+                            for w in line_words:
+                                if last_x1 is not None and (w['x0'] - last_x1) > 8:
+                                    tokens.append(" ".join(current_token))
+                                    current_token = [w['text']]
+                                else:
+                                    current_token.append(w['text'])
+                                last_x1 = w['x1']
+
+                            if current_token:
+                                tokens.append(" ".join(current_token))
+
+                            line_strings.append(f"{delimiter}".join(tokens))
+
+                        text_blocks.append(f"--- Page {idx} of {total_pages} ---\n\n" + "\n".join(line_strings))
+                    else:
+                        page_text = page.extract_text() or ""
+                        text_blocks.append(f"--- Page {idx} of {total_pages} ---\n\n" + page_text.strip())
+
+            return "\n\n".join(text_blocks)
+        except Exception:
+            pass
+
+    if PYPDF_AVAILABLE:
+        reader = pypdf.PdfReader(str(pdf_path))
+        for idx, page in enumerate(reader.pages, start=1):
             page_text = page.extract_text() or ""
-            if include_headers:
-                header = f"--- Page {idx} of {total_pages} ---"
-                text_blocks.append(f"{header}\n\n{page_text.strip()}\n")
-            else:
-                text_blocks.append(page_text.strip())
+            text_blocks.append(f"--- Page {idx} of {len(reader.pages)} ---\n\n" + page_text.strip())
+        return "\n\n".join(text_blocks)
 
-    full_text = "\n\n".join(text_blocks)
-    return full_text, total_pages
+    raise RuntimeError("No PDF library (pdfplumber or pypdf) is installed.")
 
 
 def convert_pdf_to_text(
     pdf_path: str | Path,
     output_path: str | Path | None = None,
     base_dir: Path | None = None,
-    engine: str = "auto",
-    no_page_headers: bool = False,
     quiet: bool = False
 ) -> Path:
-    """Converts a PDF file to a plain text (.txt) file in text_files/."""
+    """Converts a PDF file to a pipe-delimited text (.txt) file in text_files/."""
     script_dir = base_dir or Path(__file__).resolve().parent
     _, text_dir, _ = setup_directories(script_dir)
 
@@ -173,28 +194,8 @@ def convert_pdf_to_text(
     else:
         output_file = Path(output_path).resolve()
 
-    selected_engine = engine.lower()
-    if selected_engine == "auto":
-        if PYPDF_AVAILABLE:
-            selected_engine = "pypdf"
-        elif PDFPLUMBER_AVAILABLE:
-            selected_engine = "pdfplumber"
-        else:
-            raise RuntimeError(
-                "No supported PDF library installed. Please install 'pypdf':\n"
-                "  • Via pip: pip install pypdf --break-system-packages\n"
-                "  • Via apt: sudo apt install python3-pypdf"
-            )
-
     start_time = time.time()
-    include_headers = not no_page_headers
-
-    if selected_engine == "pypdf":
-        extracted_text, total_pages = extract_text_pypdf(input_file, include_headers=include_headers)
-    elif selected_engine == "pdfplumber":
-        extracted_text, total_pages = extract_text_pdfplumber(input_file, include_headers=include_headers)
-    else:
-        raise ValueError(f"Unsupported engine '{selected_engine}'. Use 'pypdf' or 'pdfplumber'.")
+    extracted_text = extract_text_from_pdf_with_delimiters(input_file, delimiter=" | ")
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with open(output_file, "w", encoding="utf-8") as f:
@@ -207,145 +208,200 @@ def convert_pdf_to_text(
         print(f"Text Extraction Successful!")
         print(f"  • Input PDF:    {rel_input}")
         print(f"  • Output Text:  {rel_output}")
-        print(f"  • Total Pages:  {total_pages}")
-        print(f"  • Elapsed Time: {elapsed:.2f}s")
 
     return output_file
 
 
-def parse_tables_from_text(text_content: str) -> list[dict]:
-    """
-    Parses extracted text into structured table records.
-    Groups data rows under detected schedule titles (e.g., 1ST FLOOR, 3RD FLOOR).
-    """
+def find_available_titles_in_text(text_content: str) -> list[str]:
+    """Finds potential table/schedule title headings in the text."""
+    titles = []
     lines = [line.strip() for line in text_content.splitlines() if line.strip()]
-    tables = []
-
-    schedule_titles = []
     for line in lines:
-        if any(keyword in line.upper() for keyword in ["SINGLE DUCT", "TERMINAL SCEHDULE", "TERMINAL SCHEDULE", "EQUIPMENT SCHEDULE"]):
-            schedule_titles.append(line.strip())
-
-    vav_blocks = []
-    temp_rows = []
-
-    for line in lines:
-        if line.startswith("VAV-") or re.match(r'^VAV\d*', line):
-            tokens = line.split()
-            temp_rows.append(tokens)
-        elif any(keyword in line.upper() for keyword in ["SINGLE DUCT", "TERMINAL SCEHDULE", "TERMINAL SCHEDULE", "EQUIPMENT SCHEDULE"]):
-            title = line.strip()
-            if temp_rows:
-                vav_blocks.append((title, temp_rows))
-                temp_rows = []
-
-    if temp_rows and not vav_blocks:
-        title = schedule_titles[0] if schedule_titles else "Terminal Schedule"
-        vav_blocks.append((title, temp_rows))
-
-    for title, rows in vav_blocks:
-        tables.append({
-            "title": title,
-            "headers": DEFAULT_VAV_HEADERS,
-            "rows": rows
-        })
-
-    return tables
+        if any(kw in line.upper() for kw in ["SINGLE DUCT", "TERMINAL SCEHDULE", "TERMINAL SCHEDULE", "EQUIPMENT SCHEDULE", "SCHEDULE", "TABLE"]):
+            if len(line.split()) <= 15:
+                titles.append(line)
+    return titles
 
 
-def extract_tables_from_pdf_or_text(file_path: Path) -> list[dict]:
+def parse_header_line(header_line: str) -> list[str]:
+    """Parses column headers from a header text line."""
+    if " | " in header_line:
+        cols = [c.strip() for c in header_line.split(" | ") if c.strip()]
+        if cols:
+            return cols
+    elif re.search(r'\s{2,}', header_line):
+        cols = [c.strip() for c in re.split(r'\s{2,}', header_line) if c.strip()]
+        if cols:
+            return cols
+    else:
+        cols = [c.strip() for c in header_line.split() if c.strip()]
+        if cols:
+            return cols
+
+    return []
+
+
+def extract_single_table_with_subset(
+    text_content: str,
+    target_title: str,
+    target_columns_csv: str
+) -> tuple[dict | None, list[str]]:
     """
-    Extracts tables from a PDF using pdfplumber's native table finder,
-    falling back to text-based schedule parsing if needed.
+    Locates target_title and pulls the line directly above it as the column header line.
+    Parses user column CSV from left to right, tracking position sequentially through the header line,
+    and flags any remaining unconsumed column titles in the header line as missing.
+    Returns (table_dict, flags_list).
     """
-    tables = []
+    flags = []
+    lines = [line.strip() for line in text_content.splitlines() if line.strip()]
 
-    if file_path.suffix.lower() == ".txt":
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            text_content = f.read()
-        return parse_tables_from_text(text_content)
+    requested_cols = [c.strip() for c in target_columns_csv.split(",") if c.strip()]
+    if not requested_cols:
+        flags.append("[FLAG/ERROR] No valid column titles provided in CSV input.")
+        return None, flags
 
-    if PDFPLUMBER_AVAILABLE:
-        try:
-            with pdfplumber.open(str(file_path)) as pdf:
-                for page_idx, page in enumerate(pdf.pages, start=1):
-                    extracted = page.extract_tables()
-                    for t_idx, raw_table in enumerate(extracted, start=1):
-                        if not raw_table or len(raw_table) < 2:
-                            continue
-                        headers = [str(cell or "").strip() for cell in raw_table[0]]
-                        rows = [[str(cell or "").strip() for cell in row] for row in raw_table[1:]]
-                        tables.append({
-                            "title": f"Page {page_idx} Table {t_idx}",
-                            "headers": headers,
-                            "rows": rows
-                        })
-        except Exception:
-            pass
+    # 1. Search for table title in text
+    title_line_idx = None
+    target_title_clean = target_title.strip().lower()
 
-    if not tables:
-        if PDFPLUMBER_AVAILABLE:
-            text_content, _ = extract_text_pdfplumber(file_path, include_headers=False)
-        elif PYPDF_AVAILABLE:
-            text_content, _ = extract_text_pypdf(file_path, include_headers=False)
+    for idx, line in enumerate(lines):
+        line_clean = line.strip().lower()
+        if target_title_clean in line_clean or line_clean in target_title_clean:
+            title_line_idx = idx
+            break
+
+    if title_line_idx is None:
+        avail_titles = find_available_titles_in_text(text_content)
+        title_flag = f"[FLAG/ERROR] Table title '{target_title}' was NOT found in the PDF text."
+        flags.append(title_flag)
+        if avail_titles:
+            flags.append("  • Available table titles found in PDF:\n    - " + "\n    - ".join(avail_titles))
+        return None, flags
+
+    actual_title_text = lines[title_line_idx]
+
+    # 2. Pull line directly above title as column header line
+    if title_line_idx == 0:
+        flags.append(f"[FLAG/ERROR] No column header line found above table title '{actual_title_text}'.")
+        return None, flags
+
+    header_text = lines[title_line_idx - 1]
+    pdf_columns = parse_header_line(header_text)
+
+    # 3. Left-to-right sequential search & whole-word validation
+    invalid_cols = []
+    selected_indices = []
+    selected_headers = []
+    current_pos = 0
+
+    for user_col in requested_cols:
+        user_clean = user_col.strip()
+        user_upper = user_clean.upper()
+
+        pattern = r'\b' + re.escape(user_clean) + r'\b'
+        match = re.search(pattern, header_text[current_pos:], re.IGNORECASE)
+
+        if match:
+            start_in_slice = match.start()
+            end_in_slice = match.end()
+            match_start = current_pos + start_in_slice
+            match_end = current_pos + end_in_slice
+
+            current_pos = match_end
+
+            matched_idx = None
+            for idx, col in enumerate(pdf_columns):
+                if user_upper in col.upper() or col.upper() in user_upper:
+                    matched_idx = idx
+                    break
+            if matched_idx is None and pdf_columns:
+                matched_idx = len(selected_indices)
+
+            selected_indices.append(matched_idx if matched_idx is not None else len(selected_indices))
+            selected_headers.append(user_clean)
         else:
-            raise RuntimeError("No PDF library available for extraction.")
+            invalid_cols.append(user_clean)
 
-        tables = parse_tables_from_text(text_content)
+    if invalid_cols:
+        col_flag = f"[FLAG/ERROR] The following requested column titles were NOT found as whole-word matches in sequential order in the header line:\n  • " + "\n  • ".join(invalid_cols)
+        flags.append(col_flag)
+        return None, flags
 
-    return tables
+    # 4. Check remaining unconsumed text in header line for missing columns
+    remaining_text = header_text[current_pos:].strip()
+    remaining_text_clean = re.sub(r'^[|\s,\-:_]+', '', remaining_text).strip()
+
+    if remaining_text_clean:
+        missing_cols = parse_header_line(remaining_text_clean)
+        if missing_cols:
+            missing_flag = f"[FLAG/ERROR] Not all column titles from the PDF table schedule were entered.\n  • Missing required column(s): " + ", ".join(missing_cols)
+            flags.append(missing_flag)
+            return None, flags
+
+    # 5. Collect table data rows (scanning both below and above title line)
+    data_rows = []
+
+    for idx in range(title_line_idx + 1, len(lines)):
+        line = lines[idx]
+        if any(kw in line.upper() for kw in ["SINGLE DUCT", "TERMINAL SCHEDULE", "EQUIPMENT SCHEDULE", "SCHEDULE", "TABLE"]) and idx != title_line_idx:
+            break
+        if " | " in line or line.startswith("VAV-") or re.match(r'^[A-Z0-9\-]+_[\w\-]+', line):
+            tokens = [p.strip() for p in line.split(" | ")] if " | " in line else line.split()
+            data_rows.append(tokens)
+
+    if not data_rows:
+        start_idx = max(0, title_line_idx - 120)
+        for idx in range(title_line_idx - 1, start_idx, -1):
+            line = lines[idx]
+            if line == header_text or idx == title_line_idx:
+                continue
+            if any(kw in line.upper() for kw in ["SINGLE DUCT", "TERMINAL SCHEDULE", "EQUIPMENT SCHEDULE", "SCHEDULE", "TABLE"]) and idx != title_line_idx:
+                break
+            if " | " in line or line.startswith("VAV-") or re.match(r'^[A-Z0-9\-]+_[\w\-]+', line):
+                tokens = [p.strip() for p in line.split(" | ")] if " | " in line else line.split()
+                data_rows.insert(0, tokens)
+
+    if not data_rows:
+        flags.append(f"[FLAG/ERROR] No data rows found under table title '{actual_title_text}'.")
+        return None, flags
+
+    # 6. Filter data rows to selected user columns
+    filtered_rows = []
+    for row in data_rows:
+        filtered_row = []
+        for s_idx in selected_indices:
+            if s_idx < len(row):
+                filtered_row.append(row[s_idx])
+            else:
+                filtered_row.append("-")
+        filtered_rows.append(filtered_row)
+
+    table_data = {
+        "title": actual_title_text,
+        "headers": selected_headers,
+        "rows": filtered_rows
+    }
+
+    return table_data, flags
 
 
-def sanitize_sheet_title(raw_title: str, index: int) -> str:
-    """Formats a raw schedule title into a valid Excel sheet name (max 31 chars)."""
+def sanitize_sheet_title(raw_title: str) -> str:
+    """Formats raw schedule title into a clean Excel sheet tab name."""
     clean = re.sub(r'[\\/*?:\[\]]', '', raw_title).strip()
-
-    floor_match = re.search(r'(-\s*\d+(?:ST|ND|RD|TH)\s*FLOOR|\d+(?:ST|ND|RD|TH)\s*FLOOR)', clean, re.IGNORECASE)
-    if floor_match:
-        sheet_name = f"{floor_match.group(1).replace('-', '').strip()} Sched"
-    else:
-        sheet_name = clean.replace("SINGLE DUCT & REHEAT TERMINAL ", "").replace("SCEHDULE", "SCHED").replace("SCHEDULE", "SCHED").strip()
-
-    sheet_name = sheet_name[:31] if sheet_name else f"Table_{index}"
-    return sheet_name
+    return clean or "Extracted Table"
 
 
-def convert_tables_to_excel(
-    file_path: str | Path,
-    output_excel_path: str | Path | None = None,
-    base_dir: Path | None = None,
-    quiet: bool = False
-) -> Path:
-    """
-    Extracts tabular data from a PDF or text file and writes each table to a separate tab in Excel in excel_files/.
-    """
+def export_table_to_excel(table_dict: dict, output_excel_path: Path) -> Path:
+    """Writes a single extracted table to an Excel spreadsheet."""
     if not OPENPYXL_AVAILABLE:
-        raise RuntimeError(
-            "openpyxl is required for Excel export. Please install it:\n"
-            "  • Via pip: pip install openpyxl --break-system-packages\n"
-            "  • Via apt: sudo apt install python3-openpyxl"
-        )
-
-    script_dir = base_dir or Path(__file__).resolve().parent
-    _, _, excel_dir = setup_directories(script_dir)
-
-    input_file = Path(file_path).resolve()
-
-    if output_excel_path is None:
-        output_excel = excel_dir / f"{input_file.stem}.xlsx"
-    else:
-        output_excel = Path(output_excel_path).resolve()
-
-    if not quiet:
-        print(f"Extracting table data from '{input_file.name}'...")
-
-    tables = extract_tables_from_pdf_or_text(input_file)
-
-    if not tables:
-        raise ValueError(f"No tables or schedule data found in '{input_file.name}'.")
+        raise RuntimeError("openpyxl is required to export Excel files.")
 
     wb = openpyxl.Workbook()
-    wb.remove(wb.active)  # Remove default blank sheet
+    ws = wb.active
+
+    sheet_title = sanitize_sheet_title(table_dict["title"])
+    ws.title = sheet_title[:31]
+    ws.views.sheetView[0].showGridLines = True
 
     PRIMARY_COLOR = "1F497D"  # Navy blue
     ALT_ROW_COLOR = "F2F5F9"  # Light tint
@@ -361,205 +417,119 @@ def convert_tables_to_excel(
         bottom=Side(style="thin", color=BORDER_COLOR)
     )
 
-    used_sheet_names = set()
+    headers = table_dict.get("headers", [])
+    rows = table_dict.get("rows", [])
 
-    for i, table in enumerate(tables, start=1):
-        raw_title = table.get("title", f"Table_{i}")
-        sheet_name = sanitize_sheet_title(raw_title, i)
+    # Write header row
+    for col_idx, h_text in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=h_text)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = thin_border
+    ws.row_dimensions[1].height = 28
 
-        base_name = sheet_name
-        counter = 1
-        while sheet_name in used_sheet_names:
-            suffix = f"_{counter}"
-            sheet_name = f"{base_name[:31-len(suffix)]}{suffix}"
-            counter += 1
-        used_sheet_names.add(sheet_name)
+    # Write data rows
+    for row_idx, row_data in enumerate(rows, start=2):
+        for col_idx, val in enumerate(row_data, start=1):
+            clean_val = str(val).replace(",", "").strip() if val is not None else ""
 
-        ws = wb.create_sheet(title=sheet_name)
-        ws.views.sheetView[0].showGridLines = True
+            if clean_val.isdigit():
+                cell_val = int(clean_val)
+            else:
+                try:
+                    cell_val = float(clean_val)
+                except ValueError:
+                    cell_val = val
 
-        headers = table.get("headers", [])
-        rows = table.get("rows", [])
-
-        # Write header row
-        for col_idx, h_text in enumerate(headers, start=1):
-            cell = ws.cell(row=1, column=col_idx, value=h_text)
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell = ws.cell(row=row_idx, column=col_idx, value=cell_val)
             cell.border = thin_border
-        ws.row_dimensions[1].height = 28
 
-        # Write data rows
-        for row_idx, row_data in enumerate(rows, start=2):
-            for col_idx, val in enumerate(row_data, start=1):
-                clean_val = str(val).replace(",", "").strip() if val is not None else ""
+            if row_idx % 2 == 1:
+                cell.fill = alt_fill
 
-                if clean_val.isdigit():
-                    cell_val = int(clean_val)
+            if isinstance(cell_val, (int, float)):
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+                if isinstance(cell_val, float):
+                    cell.number_format = "0.0"
                 else:
-                    try:
-                        cell_val = float(clean_val)
-                    except ValueError:
-                        cell_val = val
+                    cell.number_format = "#,##0"
+            elif str(val).strip() in ("X", "-"):
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            else:
+                cell.alignment = Alignment(horizontal="left", vertical="center")
 
-                cell = ws.cell(row=row_idx, column=col_idx, value=cell_val)
-                cell.border = thin_border
+        ws.row_dimensions[row_idx].height = 20
 
-                if row_idx % 2 == 1:
-                    cell.fill = alt_fill
+    ws.freeze_panes = "A2"
 
-                if isinstance(cell_val, (int, float)):
-                    cell.alignment = Alignment(horizontal="right", vertical="center")
-                    if isinstance(cell_val, float):
-                        cell.number_format = "0.0"
-                    else:
-                        cell.number_format = "#,##0"
-                elif str(val).strip() in ("X", "-"):
-                    cell.alignment = Alignment(horizontal="center", vertical="center")
-                else:
-                    cell.alignment = Alignment(horizontal="left", vertical="center")
+    for col in ws.columns:
+        max_len = 0
+        for cell in col:
+            val_str = str(cell.value) if cell.value is not None else ""
+            max_len = max(max_len, len(val_str))
+        col_letter = get_column_letter(col[0].column)
+        ws.column_dimensions[col_letter].width = min(max(max_len + 3, 10), 35)
 
-            ws.row_dimensions[row_idx].height = 20
-
-        # Freeze top row
-        ws.freeze_panes = "A2"
-
-        # Auto-fit column widths
-        for col in ws.columns:
-            max_len = 0
-            for cell in col:
-                val_str = str(cell.value) if cell.value is not None else ""
-                max_len = max(max_len, len(val_str))
-            col_letter = get_column_letter(col[0].column)
-            ws.column_dimensions[col_letter].width = min(max(max_len + 3, 10), 35)
-
-    output_excel.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(str(output_excel))
-
-    if not quiet:
-        rel_excel = output_excel.relative_to(script_dir) if output_excel.is_relative_to(script_dir) else output_excel
-        print(f"Excel Export Successful!")
-        print(f"  • Output Excel: {rel_excel}")
-        print(f"  • Total Tabs:   {len(tables)}")
-        for t in tables:
-            title_clean = sanitize_sheet_title(t['title'], 0)
-            print(f"    - Tab: '{title_clean}' ({len(t['rows'])} rows)")
-
-    return output_excel
+    output_excel_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(output_excel_path))
+    return output_excel_path
 
 
 def main():
     base_dir = Path(__file__).resolve().parent
     pdf_dir, text_dir, excel_dir = setup_directories(base_dir)
 
-    parser = argparse.ArgumentParser(
-        description="Convert PDF files to plain text and multi-tab Excel spreadsheets.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Directory Structure:
-  root/
-  ├── pdf_to_excel.py
-  ├── pdf_files/        (Input PDFs, e.g. page_1.pdf)
-  ├── text_files/       (Output/Input text files, e.g. page_1.txt)
-  └── excel_files/      (Output Excel files, e.g. page_1.xlsx)
+    print("\n=======================================================")
+    print("📊 Interactive PDF & Table Extractor")
+    print("=======================================================\n")
 
-Examples:
-  # Process a specific file (e.g., page_1.pdf in pdf_files/):
-  python3 pdf_to_excel.py page_1.pdf
+    # Step 1: Prompt for PDF / Input File
+    file_input = input("1. Enter the path or name of the PDF file to extract: ").strip()
 
-  # Process all PDFs in pdf_files/:
-  python3 pdf_to_excel.py
-
-  # Only export Excel spreadsheet:
-  python3 pdf_to_excel.py page_1.pdf --excel-only
-
-  # Only export text file:
-  python3 pdf_to_excel.py page_1.pdf --text-only
-"""
-    )
-
-    parser.add_argument(
-        "file_path",
-        type=str,
-        nargs="?",
-        default=None,
-        help="Path or name of the file to process (defaults to processing all PDFs in pdf_files/)."
-    )
-    parser.add_argument(
-        "-o", "--output",
-        type=str,
-        default=None,
-        help="Custom path for output text file."
-    )
-    parser.add_argument(
-        "--excel-output",
-        type=str,
-        default=None,
-        help="Custom path for output Excel file."
-    )
-    parser.add_argument(
-        "--excel-only",
-        action="store_true",
-        help="Only generate the Excel file, skipping text output."
-    )
-    parser.add_argument(
-        "--text-only",
-        action="store_true",
-        help="Only generate the text file, skipping Excel output."
-    )
-    parser.add_argument(
-        "-e", "--engine",
-        choices=["auto", "pypdf", "pdfplumber"],
-        default="auto",
-        help="PDF text extraction engine (default: auto)."
-    )
-    parser.add_argument(
-        "-q", "--quiet",
-        action="store_true",
-        help="Suppress console status messages."
-    )
-
-    args = parser.parse_args()
-
-    files_to_process = []
-
-    if args.file_path:
-        resolved_file = resolve_input_file(args.file_path, base_dir)
-        files_to_process.append(resolved_file)
-    else:
-        pdf_candidates = list(pdf_dir.glob("*.pdf")) + list(pdf_dir.glob("*.PDF"))
-        if pdf_candidates:
-            files_to_process = sorted(pdf_candidates)
-        else:
-            text_candidates = list(text_dir.glob("*.txt"))
-            if text_candidates:
-                files_to_process = sorted(text_candidates)
-
-    if not files_to_process:
-        print(f"No PDF files found in '{pdf_dir}'. Please place PDF files in 'pdf_files/' and rerun.", file=sys.stderr)
+    try:
+        input_file = resolve_input_file(file_input, base_dir)
+    except FileNotFoundError as e:
+        print(f"\n❌ [FLAG/ERROR] {e}", file=sys.stderr)
         sys.exit(1)
 
-    for current_file in files_to_process:
-        try:
-            if not args.excel_only and current_file.suffix.lower() == ".pdf":
-                convert_pdf_to_text(
-                    pdf_path=current_file,
-                    output_path=args.output,
-                    base_dir=base_dir,
-                    engine=args.engine,
-                    quiet=args.quiet
-                )
+    # Read/extract text with explicit column delimiters (|)
+    if input_file.suffix.lower() == ".pdf":
+        convert_pdf_to_text(input_file, base_dir=base_dir)
+        text_out = text_dir / f"{input_file.stem}.txt"
+        text_content = text_out.read_text(encoding="utf-8")
+    else:
+        text_content = input_file.read_text(encoding="utf-8", errors="ignore")
 
-            if not args.text_only:
-                convert_tables_to_excel(
-                    file_path=current_file,
-                    output_excel_path=args.excel_output,
-                    base_dir=base_dir,
-                    quiet=args.quiet
-                )
+    # Step 2: Prompt for Table Title
+    table_title = input("\n2. Enter the EXACT Title of the table you want to extract: ").strip()
 
-        except Exception as e:
-            print(f"Error processing '{current_file.name}': {e}", file=sys.stderr)
+    # Step 3: Prompt for Column Titles
+    target_columns = input("\n3. Enter the EXACT column titles to extract (CSV format) for column delimiting: ").strip()
+
+    print("\nProcessing extraction...")
+
+    # Step 4: Extract Table and Subset
+    table_dict, flags = extract_single_table_with_subset(text_content, table_title, target_columns)
+
+    if flags:
+        print("\n--- Flags & Status Output ---")
+        for flag in flags:
+            print(flag)
+
+    if table_dict is None:
+        print("\n❌ Table extraction failed. Please check the flags above and try again.")
+        sys.exit(1)
+
+    # Step 5: Export to Excel
+    output_excel = excel_dir / f"{input_file.stem}.xlsx"
+    saved_path = export_table_to_excel(table_dict, output_excel)
+
+    rel_excel = saved_path.relative_to(base_dir) if saved_path.is_relative_to(base_dir) else saved_path
+    print(f"\n✅ Table Extraction Successful!")
+    print(f"  • Output Excel: {rel_excel}")
+    print(f"  • Tab Name:     '{sanitize_sheet_title(table_dict['title'])}'")
+    print(f"  • Rows Exported: {len(table_dict['rows'])}\n")
 
 
 if __name__ == "__main__":
